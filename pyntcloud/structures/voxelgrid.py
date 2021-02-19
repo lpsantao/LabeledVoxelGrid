@@ -21,6 +21,8 @@ class VoxelGrid(Structure):
                  colors=None,
                  n_x=1, n_y=1, n_z=1,
                  size_x=None, size_y=None, size_z=None,
+                 bb=None,
+                 r_pts=None, h_pts=None, o_pts=None,
                  regular_bounding_box=True):
         """Grid of voxels with support for different build methods.
 
@@ -38,6 +40,13 @@ class VoxelGrid(Structure):
             Default: None
             The desired voxel size along each axis.
             If not None, the corresponding n_x, n_y or n_z will be ignored.
+        bb:  dict with keys 'human','robot','object', and 'other', with values None or (N,8,3) 3D numpy.ndarray
+            Default None.
+            The bounding box boxes for each key
+            If not None, parsed and used for labeled voxel-grid, if none ignored
+        h_pts, r_pts, o_pts: np.array with 3D points for human(h_pts), robot(r_pts), and obj(o_pts)
+            Default: None
+            ex: h_pts = [[1, 1, 1],[2, 2, 4],[ 1.4, 1.3, 2.1]]
         regular_bounding_box : bool, optional
             Default: True
             If True, the bounding box of the point cloud will be adjusted
@@ -48,7 +57,11 @@ class VoxelGrid(Structure):
         self.x_y_z = np.asarray([n_x, n_y, n_z])
         self.sizes = np.asarray([size_x, size_y, size_z])
         self.regular_bounding_box = regular_bounding_box
-
+        self.bb_dict = bb  
+        self.human_pts = h_pts
+        self.robot_pts = r_pts
+        self.object_pts = o_pts
+        
         self.id = None
         self.xyzmin, self.xyzmax = None, None
         self.segments = None
@@ -58,6 +71,9 @@ class VoxelGrid(Structure):
         self.voxel_n = None
         self.voxel_centers = None
         self.voxel_colors = None
+        self.voxels_labeled_dict = dict.fromkeys(bb.keys())
+        labels = [50, 75, 100, 25]      
+        self.labels_dict = dict(zip(bb.keys(), labels)) # label_id nr for each type of bb: 'human':50, 'robot':75, 'object':100, 'other':25
 
     @classmethod
     def extract_info(cls, pyntcloud):
@@ -75,8 +91,11 @@ class VoxelGrid(Structure):
 
     def compute(self):
         """ABC API."""
-        xyzmin = self._points.min(0)
-        xyzmax = self._points.max(0)
+        xyzmin = np.array([0, 0, 0])
+        xyzmax = np.array([3, 3, 3])
+        xmin = self._points.min(0)
+        xmax = self._points.max(0)
+        print(xmin, xmax)
         xyz_range = self._points.ptp(0)
 
         if self.regular_bounding_box:
@@ -107,6 +126,8 @@ class VoxelGrid(Structure):
             segments.append(s)
             shape.append(step)
 
+        # segments gives start of each voxel in each axis
+        # shape gives size of each voxel in each axis
         self.segments = segments
         self.shape = shape
 
@@ -120,6 +141,30 @@ class VoxelGrid(Structure):
         self.voxel_y = np.clip(np.searchsorted(self.segments[1], self._points[:, 1]) - 1, 0, self.x_y_z[1])
         self.voxel_z = np.clip(np.searchsorted(self.segments[2], self._points[:, 2]) - 1, 0,  self.x_y_z[2])
         self.voxel_n = np.ravel_multi_index([self.voxel_x, self.voxel_y, self.voxel_z], self.x_y_z)
+        
+        # when bounding box given
+        if self.bb_dict is not None:
+            for key, v in self.bb_dict.items():
+                if self.bb_dict[key] is None:       # if no bbox given
+                    continue
+                else:
+                    voxel_label = []
+                    bb_values = (self.bb_dict[key])
+                    if bb_values.ndim != 3:
+                        raise ValueError("Value from Bounding Box dict key: {0} ".format(
+                            key) + " has {0} dimensions, should be 3-dimensional array".format(bb_values.ndim))
+                    for id_bb in range(len(bb_values)):
+                        bb_limits = [bb_values[id_bb].min(axis=0), bb_values[id_bb].max(axis=0)]
+                        bbmin = bb_limits[0]
+                        bbmax = bb_limits[1]
+                        inidx = np.all((bbmin <= self._points) & (self._points <= bbmax), axis=1)
+                        inbox = self._points[inidx]
+                        vxl = np.clip(np.searchsorted(self.segments[0], inbox[:, 0]) - 1, 0, self.x_y_z[0])
+                        vyl = np.clip(np.searchsorted(self.segments[1], inbox[:, 1]) - 1, 0, self.x_y_z[1])
+                        vzl = np.clip(np.searchsorted(self.segments[2], inbox[:, 2]) - 1, 0, self.x_y_z[2])
+                        vl = np.ravel_multi_index([vxl, vyl, vzl], x_y_z)
+                        voxel_label.append(vl)
+                self.voxels_labeled_dict[key] = voxel_label
 
         # compute center of each voxel
         midsegments = [(self.segments[i][1:] + self.segments[i][:-1]) / 2 for i in range(3)]
@@ -204,7 +249,23 @@ class VoxelGrid(Structure):
             # truncation = np.linalg.norm(self.shape)
             kdt = cKDTree(self._points)
             vector, i = kdt.query(self.voxel_centers, n_jobs=-1)
-
+        
+        elif mode == "labeled":
+            vector[np.unique(self.voxel_n)] = 10
+            for k, val in self.voxels_labeled_dict.items():
+                if self.voxels_labeled_dict[k]:
+                    for id in range(len(self.voxels_labeled_dict[k])):
+                        vector[self.voxels_labeled_dict[k][id]] = self.labels_dict[k]
+            if self.human_pts is not None:
+                hvoxel = self.query(self.human_pts)
+                vector[hvoxel] = self.labels_dict['human']
+            if self.robot_pts is not None:
+                rvoxel = self.query(self.robot_pts)
+                vector[rvoxel] = self.labels_dict['robot']
+            if self.object_pts is not None:
+                ovoxel = self.query(self.object_pts)
+                vector[ovoxel] = self.labels_dict['object']
+                
         elif mode.endswith("_max"):
             if not is_numba_avaliable:
                 raise ImportError("numba is required to compute {}".format(mode))
